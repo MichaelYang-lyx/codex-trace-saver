@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""codex-save-trace — CLI entry point for the codex-trace-saver plugin.
+
+By default: scans the current/most-recent Codex rollout for files touched
+via shell / read_file / write_file / apply_patch / search_files, and
+previews what would be uploaded. Add --yes to actually upload.
+
+Usage:
+  codex-save-trace                    scan + preview (does NOT upload)
+  codex-save-trace --yes              scan + upload (+1 on leaderboard)
+  codex-save-trace --yes --local      save the zip locally, no upload
+  codex-save-trace list               list recent rollouts
+  codex-save-trace --yes -x *.log     scan minus *.log
+  codex-save-trace --yes -a foo.csv   scan plus foo.csv
+  codex-save-trace --yes --only *.py  keep only .py
+  codex-save-trace --yes --no-files   trace only, no work files
+  codex-save-trace --yes <rollout-id> upload a specific rollout
+  codex-save-trace help               full help
+
+Env:
+  TRACE_LEADERBOARD_NAME    board display name (default: system user)
+  TRACE_LEADERBOARD_URL     board URL (default: http://10.9.66.12:8848)
+  TRACE_SAVE_DIR            local mode output dir (default: ~/codex-traces)
+  CODEX_HOME                default: ~/.codex
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import os
+import sys
+from pathlib import Path
+
+# Allow standalone imports when the CLI runs from ~/.local/bin.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+import uploader  # noqa: E402
+import filepicker  # noqa: E402
+
+
+HELP = """\
+codex-save-trace — package the current Codex rollout + touched files, upload to leaderboard.
+
+Preview (no upload):
+  codex-save-trace                         scan + preview
+  codex-save-trace <rollout-id>            preview a specific rollout
+  codex-save-trace all                     preview all rollouts (bundled)
+
+Upload:
+  codex-save-trace --yes                   scan + upload (+1)
+  codex-save-trace --yes --local           save zip locally instead of uploading
+  codex-save-trace --yes -o <dir>          local output dir
+  codex-save-trace --yes --name <name>     override leaderboard name
+
+Trace-only / attach-file tweaks (use with --yes):
+  codex-save-trace --yes --no-files        trace only, no work files
+  codex-save-trace --yes -x <pat>          drop matching files (repeatable)
+  codex-save-trace --yes -a <path>         add an extra file (repeatable)
+  codex-save-trace --yes --only <pat>      keep only matches (repeatable)
+
+Utilities:
+  codex-save-trace list [N]                list N (default 15) recent rollouts
+
+Env (all optional):
+  TRACE_LEADERBOARD_NAME   your display name on the board (default: system user)
+  TRACE_LEADERBOARD_URL    board URL (default: http://10.9.66.12:8848)
+  TRACE_SAVE_DIR           --local output dir (default: ~/codex-traces)
+  CODEX_HOME               default: ~/.codex
+"""
+
+
+def _parse_args(argv):
+    opts = {
+        "session": "latest", "name": None, "note": "", "yes": False,
+        "local": False, "out_dir": None, "no_files": False,
+        "exclude": [], "add": [], "only": [], "help": False, "list_n": None,
+    }
+    positionals = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("help", "-h", "--help"):
+            opts["help"] = True
+            return opts
+        elif tok in ("list", "ls", "sessions"):
+            opts["list_n"] = 15
+        elif opts["list_n"] is not None and tok.isdigit():
+            opts["list_n"] = max(1, min(int(tok), 100))
+        elif tok in ("--yes", "-y"):
+            opts["yes"] = True
+        elif tok in ("--local", "-l"):
+            opts["local"] = True
+        elif tok in ("--no-files", "--trace-only"):
+            opts["no_files"] = True
+        elif tok in ("--out-dir", "--out", "-o"):
+            if i + 1 >= len(argv):
+                raise ValueError(f"{tok} needs a directory")
+            opts["out_dir"] = argv[i + 1]; opts["local"] = True; i += 1
+        elif tok.startswith("--out-dir="):
+            opts["out_dir"] = tok.split("=", 1)[1]; opts["local"] = True
+        elif tok == "--name":
+            if i + 1 >= len(argv):
+                raise ValueError("--name needs a value")
+            opts["name"] = argv[i + 1]; i += 1
+        elif tok.startswith("--name="):
+            opts["name"] = tok.split("=", 1)[1]
+        elif tok in ("--note", "-n"):
+            if i + 1 >= len(argv):
+                raise ValueError(f"{tok} needs a value")
+            opts["note"] = argv[i + 1]; i += 1
+        elif tok.startswith("--note="):
+            opts["note"] = tok.split("=", 1)[1]
+        elif tok in ("--exclude", "--drop", "-x"):
+            if i + 1 >= len(argv):
+                raise ValueError(f"{tok} needs a pattern")
+            opts["exclude"].append(argv[i + 1]); i += 1
+        elif tok.startswith("--exclude="):
+            opts["exclude"].append(tok.split("=", 1)[1])
+        elif tok in ("--add", "-a"):
+            if i + 1 >= len(argv):
+                raise ValueError(f"{tok} needs a path")
+            opts["add"].append(argv[i + 1]); i += 1
+        elif tok.startswith("--add="):
+            opts["add"].append(tok.split("=", 1)[1])
+        elif tok == "--only":
+            if i + 1 >= len(argv):
+                raise ValueError("--only needs a pattern")
+            opts["only"].append(argv[i + 1]); i += 1
+        elif tok.startswith("--only="):
+            opts["only"].append(tok.split("=", 1)[1])
+        else:
+            positionals.append(tok)
+        i += 1
+
+    if positionals:
+        opts["session"] = positionals[0]
+    return opts
+
+
+def _match_pattern(path, pattern):
+    p = Path(path)
+    pat = pattern.strip()
+    if not pat:
+        return False
+    if str(p) == pat:
+        return True
+    if p.name == pat:
+        return True
+    if fnmatch.fnmatch(p.name, pat):
+        return True
+    if fnmatch.fnmatch(str(p), pat):
+        return True
+    return False
+
+
+def _apply_tweaks(kept, excludes, adds, onlys):
+    changes = []
+    final = list(kept)
+    if onlys:
+        matched = []
+        for p in final:
+            if any(_match_pattern(p, pat) for pat in onlys):
+                matched.append(p)
+            else:
+                changes.append(("-", p, "--only filter"))
+        final = matched
+    for pat in excludes:
+        removed = [p for p in final if _match_pattern(p, pat)]
+        for p in removed:
+            changes.append(("-", p, f"--exclude {pat}"))
+        final = [p for p in final if p not in removed]
+        if not removed:
+            changes.append(("!", Path(pat), f"--exclude {pat} matched nothing"))
+    if adds:
+        add_kept, add_rej = filepicker.filter_paths([Path(p) for p in adds])
+        existing = {str(Path(p).expanduser().resolve()) for p in final
+                    if Path(p).exists()}
+        for p in add_kept:
+            key = str(p.resolve()) if p.exists() else str(p)
+            if key in existing:
+                changes.append(("!", p, "--add: already in list"))
+                continue
+            final.append(p)
+            changes.append(("+", p, "--add"))
+        for p, why in add_rej:
+            changes.append(("✗", p, f"--add rejected: {why}"))
+    return final, changes
+
+
+def _format_bundle_preview(session_path, kept, rejected, changes):
+    lines = []
+    if session_path is not None:
+        sp_str = str(session_path)
+        env_file = os.environ.get("CODEX_SESSION_FILE", "").strip()
+        env_sid = os.environ.get("CODEX_SESSION_ID", "").strip() or \
+                  os.environ.get("CODEX_ROLLOUT_ID", "").strip()
+        if env_file and str(Path(env_file).expanduser()) == sp_str:
+            tag = "当前会话 (来自 CODEX_SESSION_FILE)"
+        elif env_sid and env_sid in session_path.name:
+            tag = "当前会话 (来自 CODEX_SESSION_ID)"
+        else:
+            tag = "最新 rollout (按 mtime)"
+        lines.append(f"rollout: {session_path.name}  [{tag}]")
+    total = sum(_safe_stat(p) for p in kept)
+    lines.append(f"attach files: {len(kept)} file(s), ~{total / 1024:.1f} KB")
+    for p in kept:
+        lines.append(f"  ✓ {p}  ({_safe_stat(p)} B)")
+    if rejected:
+        lines.append(f"skipped     : {len(rejected)} file(s)")
+        for p, why in rejected[:20]:
+            lines.append(f"  ✗ {p}  — {why}")
+        if len(rejected) > 20:
+            lines.append(f"  ... and {len(rejected) - 20} more")
+    if changes:
+        lines.append("tweaks:")
+        for marker, p, reason in changes:
+            lines.append(f"  {marker} {p}  — {reason}")
+    lines.append("")
+    lines.append("Add --yes to upload  (or --yes --local to save the zip locally).")
+    lines.append("Tweak: -x <pat> drop / -a <path> add / --only <pat> / --no-files.")
+    return "\n".join(lines)
+
+
+def _safe_stat(p):
+    try:
+        return Path(p).stat().st_size
+    except OSError:
+        return 0
+
+
+def _format_rollout_list(files, limit):
+    if not files:
+        return f"No Codex rollouts found under {uploader.sessions_dir()}."
+    from datetime import datetime as _dt
+    lines = ["最近的 rollouts (按 mtime, 最新在上):",
+             "",
+             f"  {'rollout file':<50}  {'mtime':<19}  {'size':>10}",
+             f"  {'-'*50}  {'-'*19}  {'-'*10}"]
+    for f in files[:limit]:
+        try:
+            mtime = _dt.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            size = f"{f.stat().st_size / 1024:.1f} KB"
+        except OSError:
+            mtime, size = "?", "?"
+        lines.append(f"  {f.name:<50}  {mtime:<19}  {size:>10}")
+    lines.append("")
+    lines.append("上传其中一个:  codex-save-trace --yes <rollout-id-substring>")
+    return "\n".join(lines)
+
+
+def _scan_and_filter():
+    session_path = uploader.current_session_file()
+    if session_path is None:
+        raise FileNotFoundError(
+            f"No Codex rollout found under {uploader.sessions_dir()}"
+        )
+    raw = filepicker.scan_rollout(session_path)
+    kept, rejected = filepicker.filter_paths([Path(p) for p in raw])
+    return kept, rejected, session_path
+
+
+def main(argv=None):
+    argv = argv if argv is not None else sys.argv[1:]
+    try:
+        opts = _parse_args(argv)
+    except ValueError as exc:
+        print(f"⚠️  {exc}\n\n{HELP}", file=sys.stderr)
+        return 2
+
+    if opts["help"]:
+        print(HELP)
+        return 0
+
+    if opts["list_n"] is not None:
+        print(_format_rollout_list(uploader.list_rollouts(), opts["list_n"]))
+        return 0
+
+    session = opts["session"]
+    name = opts["name"]
+    note = opts["note"]
+    yes = opts["yes"]
+    local = opts["local"]
+    out_dir = opts["out_dir"]
+
+    try:
+        # Attached files
+        kept, rejected, changes, session_path = [], [], [], None
+        if not opts["no_files"]:
+            scanned, rejected, session_path = _scan_and_filter()
+            kept, changes = _apply_tweaks(scanned, opts["exclude"],
+                                          opts["add"], opts["only"])
+        else:
+            files, _ = uploader.resolve_sessions(session)
+            session_path = files[0] if files else None
+
+        if not yes:
+            if opts["no_files"]:
+                if session_path is None:
+                    return _err(f"No Codex rollout for selector '{session}'.")
+                print(
+                    f"rollout: {session_path.name}\n"
+                    f"attach files: none (--no-files)\n\n"
+                    "Add --yes to upload  (or --yes --local to save locally)."
+                )
+                return 0
+            print(_format_bundle_preview(session_path, kept, rejected, changes))
+            return 0
+
+        extra = [str(p) for p in kept]
+        res = uploader.save_trace_bundle(
+            session=session, extra_files=extra, name=name, note=note,
+            local=local, out_dir=out_dir,
+        )
+        icon = "💾" if res.get("mode") == "local" else "📤"
+        print(f"{icon} {res['message']}")
+        return 0
+
+    except (FileNotFoundError, ValueError) as exc:
+        return _err(str(exc))
+    except ConnectionError as exc:
+        return _err(f"Leaderboard unreachable: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"codex-save-trace failed: {type(exc).__name__}: {exc}")
+
+
+def _err(msg):
+    print(f"⚠️  {msg}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
