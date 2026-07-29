@@ -143,6 +143,38 @@ _SEARCH_TOOLS = {"search_files", "grep", "glob", "find_files", "list_files"}
 _ABS_OR_HOME_PATH_RE = re.compile(r"(?<![\w])(/[^\s'\"`;|&<>()]+|~/[^\s'\"`;|&<>()]+)")
 # Simple ./foo.ext or foo.ext token — for scanning result output.
 _REL_PATH_RE = re.compile(r"(?:\./|(?<![\w./]))([\w.\-一-鿿]+\.[A-Za-z0-9]{1,8})")
+# Broader "anything with a file extension" — catches unicode filenames with
+# parens/spaces (e.g. `应用链接改上传327(1).xlsx`). Deliberately permissive
+# — the safety filter (existence check + size + sensitive) is the real gate.
+# We ONLY match tokens quoted with ' or ", or that appear whole in a
+# line by themselves, to reduce false positives from prose.
+_QUOTED_FILE_RE = re.compile(
+    r"['\"]([^'\"\n]{1,255}\.[A-Za-z0-9]{1,8})['\"]"
+)
+_BAREFILE_LINE_RE = re.compile(
+    r"^([^\s/'\"`;|&<>()\n]{1,255}\.[A-Za-z0-9]{1,8})\s*$"
+)
+
+
+def _extract_named_files(haystack: str) -> List[str]:
+    """Pull file-like tokens from shell input / output text.
+
+    Combines three signals:
+      * absolute / home paths (existing regex)
+      * quoted names with a file extension (e.g. p='foo.xlsx')
+      * bare filenames on their own line (e.g. ls output)
+    """
+    out: List[str] = []
+    for m in _ABS_OR_HOME_PATH_RE.findall(haystack):
+        out.append(m)
+    for m in _QUOTED_FILE_RE.findall(haystack):
+        out.append(m)
+    for line in haystack.splitlines():
+        ln = line.strip()
+        m = _BAREFILE_LINE_RE.match(ln)
+        if m:
+            out.append(m.group(1))
+    return out
 
 
 def _load_shell_command(args_obj) -> str:
@@ -217,8 +249,7 @@ def _paths_from_function_call(name: str, args_raw) -> Tuple[List[str], Optional[
                         out.append(tok)
             except ValueError:
                 pass
-            for m in _ABS_OR_HOME_PATH_RE.findall(haystack):
-                out.append(m)
+            out.extend(_extract_named_files(haystack))
             # Also pull an embedded workdir/cwd from a JS-code style input
             # like ``exec_command({cmd:"...","workdir":"/foo"})``.
             if base is None:
@@ -262,15 +293,15 @@ def _paths_from_result_output(content, base: Optional[str]) -> List[str]:
     except (TypeError, ValueError):
         pass
 
-    # Plain-text fallback — one path per line or ./relative tokens
+    # Plain-text fallback — grab paths + bare filenames on their own lines.
     if not out:
+        out.extend(_extract_named_files(text))
+        # Also scan each line for absolute paths that share a line with prose.
         for line in text.splitlines():
             ln = line.strip()
             if not ln:
                 continue
-            if ln.startswith(("/", "~")):
-                out.append(ln)
-            elif ln.startswith("./") or _REL_PATH_RE.search(ln):
+            if ln.startswith(("/", "~")) and ln not in out:
                 out.append(ln)
 
     # Resolve relatives against base dir; else codex process cwd
@@ -451,9 +482,11 @@ def scan_rollout(session_path: Optional[Path] = None) -> List[str]:
             if fc is not None:
                 name, args_raw, call_id = fc
                 paths, base = _paths_from_function_call(name, args_raw)
-                _remember(paths)
-                # Prefer the tool's own cwd arg; fall back to rollout cwd.
+                # Resolve any bare-basename hits against the call's cwd
+                # (or the rollout's cwd) so `p='foo.xlsx'` gets a full path.
                 effective_base = base or rollout_cwd
+                paths = _resolve_relative_paths(paths, effective_base)
+                _remember(paths)
                 if call_id and effective_base:
                     call_bases[call_id] = effective_base
                 continue
@@ -475,12 +508,35 @@ def scan_rollout(session_path: Optional[Path] = None) -> List[str]:
                     args_raw = fn.get("arguments") or "{}"
                     call_id = tc.get("id") or tc.get("call_id") or ""
                     paths, base = _paths_from_function_call(name, args_raw)
-                    _remember(paths)
                     effective_base = base or rollout_cwd
+                    paths = _resolve_relative_paths(paths, effective_base)
+                    _remember(paths)
                     if call_id and effective_base:
                         call_bases[call_id] = effective_base
 
     return ordered
+
+
+def _resolve_relative_paths(paths: List[str], base: Optional[str]) -> List[str]:
+    """Turn bare filenames / ./relative into absolute paths using *base*."""
+    if not paths:
+        return paths
+    from pathlib import Path as _P
+    if base:
+        base_p = _P(base).expanduser()
+    else:
+        base_p = None
+    out: List[str] = []
+    for p in paths:
+        pp = _P(p)
+        if pp.is_absolute() or p.startswith("~"):
+            out.append(p)
+        elif base_p is not None:
+            rel = p[2:] if p.startswith("./") else p
+            out.append(str(base_p / rel))
+        else:
+            out.append(p)
+    return out
 
 
 # --------------------------------------------------------------------------- #
