@@ -115,7 +115,7 @@ _PATH_ARG_TOOLS = {
     "read_file", "write_file", "view_file", "edit_file",
     "apply_patch",  # Codex's canonical file-edit tool
 }
-_SHELL_TOOLS = {"shell", "exec", "bash", "container.exec"}
+_SHELL_TOOLS = {"shell", "exec", "bash", "container.exec", "exec_command"}
 _SEARCH_TOOLS = {"search_files", "grep", "glob", "find_files", "list_files"}
 
 # Absolute or home-relative path token in a shell command.
@@ -141,13 +141,26 @@ def _load_shell_command(args_obj) -> str:
 
 
 def _paths_from_function_call(name: str, args_raw) -> Tuple[List[str], Optional[str]]:
-    """Extract paths + base-dir hint from a Codex function_call event."""
-    try:
-        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-    except (TypeError, ValueError):
-        args = {}
-    if not isinstance(args, dict):
-        args = {}
+    """Extract paths + base-dir hint from a Codex function_call event.
+
+    ``args_raw`` may be:
+      * A JSON string (classic function_call.arguments)
+      * A JS-code string (codex v0.146 custom_tool_call.input, e.g.
+        ``const r = await tools.exec_command({cmd:"ls /foo","workdir":"/bar"})``)
+      * A dict already parsed
+    """
+    args: dict = {}
+    args_str: str = ""
+    if isinstance(args_raw, dict):
+        args = args_raw
+    elif isinstance(args_raw, str):
+        args_str = args_raw
+        try:
+            parsed = json.loads(args_raw)
+            if isinstance(parsed, dict):
+                args = parsed
+        except (TypeError, ValueError):
+            args = {}
 
     out: List[str] = []
     base: Optional[str] = None
@@ -173,15 +186,24 @@ def _paths_from_function_call(name: str, args_raw) -> Tuple[List[str], Optional[
         if isinstance(cwd, str) and cwd.strip():
             base = cwd.strip()
         cmd = _load_shell_command(args)
-        if cmd:
+        # v0.146 custom_tool_call: args_str is JS source, not JSON. Fall
+        # back to scanning the raw string for cwd+paths.
+        haystack = cmd if cmd else args_str
+        if haystack:
             try:
-                for tok in shlex.split(cmd, posix=True):
+                for tok in shlex.split(haystack, posix=True):
                     if tok.startswith(("/", "~")):
                         out.append(tok)
             except ValueError:
                 pass
-            for m in _ABS_OR_HOME_PATH_RE.findall(cmd):
+            for m in _ABS_OR_HOME_PATH_RE.findall(haystack):
                 out.append(m)
+            # Also pull an embedded workdir/cwd from a JS-code style input
+            # like ``exec_command({cmd:"...","workdir":"/foo"})``.
+            if base is None:
+                m = re.search(r'"?(workdir|cwd)"?\s*:\s*"([^"]+)"', haystack)
+                if m:
+                    base = m.group(2)
     elif name in _SEARCH_TOOLS:
         for key in ("cwd", "root", "dir", "directory", "path", "target"):
             v = args.get(key)
@@ -252,21 +274,111 @@ def _paths_from_result_output(content, base: Optional[str]) -> List[str]:
     return resolved
 
 
+def _unwrap_event(evt: dict) -> dict:
+    """Peel off codex v0.146's ``{timestamp, type, payload}`` envelope.
+
+    Real codex v0.146 writes each rollout line as::
+
+        {"timestamp":"...","type":"response_item","payload":{"type":"function_call",...}}
+        {"timestamp":"...","type":"event_msg","payload":{"type":"task_started",...}}
+        {"timestamp":"...","type":"session_meta","payload":{"cwd":"...","cli_version":"..."}}
+        {"timestamp":"...","type":"turn_context","payload":{"cwd":"...","model":"..."}}
+
+    Older / flat writers just put ``{type, name, arguments, ...}`` at the top
+    level. Return the inner dict we should inspect for tool-call fields.
+    """
+    payload = evt.get("payload")
+    if isinstance(payload, dict):
+        return payload
+    return evt
+
+
 def _extract_function_call(evt: dict) -> Optional[Tuple[str, str, str]]:
     """Return (name, arguments, call_id) if *evt* is a function_call, else None.
 
-    Handles multiple shapes we've seen in Codex/Responses-API rollouts:
-      Codex Responses-style:
-        {"type":"function_call","name":"shell","arguments":"...","call_id":"..."}
-      Nested (chat-completions-style leftover):
-        {"type":"message","message":{"tool_calls":[{"function":{"name":..,
-          "arguments":..},"id":"..."}]}}
+    Supports:
+
+    * codex v0.146 custom_tool_call: ``{type:'response_item', payload:{type:'custom_tool_call',name:'exec',input:'<JS code>',call_id}}``
+    * codex v0.146 wrapped: ``{type:'response_item', payload:{type:'function_call',name,arguments,call_id}}``
+    * flat responses: ``{type:'function_call', name, arguments, call_id}``
+    * chat-completions leftover: ``{message:{tool_calls:[{function:{name,arguments},id}]}}``
     """
-    t = evt.get("type")
-    if t == "function_call":
+    inner = _unwrap_event(evt)
+    inner_type = inner.get("type")
+    if inner_type == "custom_tool_call":
+        # Codex v0.146 stores the tool argument as a JS-code string in `input`,
+        # not JSON in `arguments`. We pass the raw string through — the shell
+        # branch in _paths_from_function_call() scans it with a path regex
+        # that doesn't require JSON.
+        return (inner.get("name") or "",
+                inner.get("input") or "",
+                inner.get("call_id") or inner.get("id") or "")
+    if inner_type == "function_call":
+        return (inner.get("name") or "",
+                inner.get("arguments") or "{}",
+                inner.get("call_id") or inner.get("id") or "")
+    # flat form (in case codex ever writes without the envelope)
+    if evt.get("type") == "function_call":
         return (evt.get("name") or "",
                 evt.get("arguments") or "{}",
                 evt.get("call_id") or evt.get("id") or "")
+    return None
+
+
+def _extract_function_call_output(evt: dict) -> Optional[Tuple[str, str]]:
+    """Return (call_id, output_text) if this event is a tool-call result.
+
+    Real codex v0.146 output shape::
+
+        {"payload":{"type":"custom_tool_call_output","call_id":"...",
+                    "output":[{"type":"input_text","text":"..."}, ...]}}
+
+    We concatenate the pieces so downstream regex scanning sees one blob.
+    """
+    inner = _unwrap_event(evt)
+    inner_type = inner.get("type")
+    if inner_type in ("custom_tool_call_output", "function_call_output"):
+        out = inner.get("output")
+        return (inner.get("call_id") or "", _flatten_output(out))
+    # Flat form
+    if evt.get("type") in ("custom_tool_call_output", "function_call_output"):
+        return (evt.get("call_id") or "", _flatten_output(evt.get("output")))
+    return None
+
+
+def _flatten_output(raw) -> str:
+    """Codex tool output can be a plain string OR a list of ``{type,text}``.
+
+    Turn any of those into a single string for path scanning.
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list):
+        parts = []
+        for item in raw:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                # {type: input_text/output_text, text: "..."}
+                s = item.get("text") or item.get("content") or item.get("output") or ""
+                if isinstance(s, str):
+                    parts.append(s)
+        return "\n".join(parts)
+    return str(raw)
+
+
+def _extract_turn_cwd(evt: dict) -> Optional[str]:
+    """If *evt* is a turn_context or session_meta with a cwd, return it.
+
+    codex v0.146 puts the real agent cwd here — no need to scan /proc.
+    """
+    if evt.get("type") in ("turn_context", "session_meta"):
+        inner = _unwrap_event(evt)
+        cwd = inner.get("cwd")
+        if isinstance(cwd, str) and cwd.strip():
+            return cwd.strip()
     return None
 
 
@@ -284,6 +396,9 @@ def scan_rollout(session_path: Optional[Path] = None) -> List[str]:
     # call_id -> base dir hint carried over from the function_call so we can
     # resolve relatives in the matching function_call_output later.
     call_bases: dict = {}
+    # The rollout may declare its own cwd (turn_context.cwd / session_meta.cwd);
+    # use the most recent one as the default base when resolving relatives.
+    rollout_cwd: Optional[str] = None
 
     def _remember(paths):
         for p in paths:
@@ -303,18 +418,30 @@ def scan_rollout(session_path: Optional[Path] = None) -> List[str]:
             if not isinstance(evt, dict):
                 continue
 
+            # Track the agent's declared cwd (turn_context / session_meta) so
+            # later function_call_output rows resolve their relative paths
+            # against the right base — codex records this, we shouldn't guess.
+            declared_cwd = _extract_turn_cwd(evt)
+            if declared_cwd:
+                rollout_cwd = declared_cwd
+                continue
+
             fc = _extract_function_call(evt)
             if fc is not None:
                 name, args_raw, call_id = fc
                 paths, base = _paths_from_function_call(name, args_raw)
                 _remember(paths)
-                if call_id and base:
-                    call_bases[call_id] = base
+                # Prefer the tool's own cwd arg; fall back to rollout cwd.
+                effective_base = base or rollout_cwd
+                if call_id and effective_base:
+                    call_bases[call_id] = effective_base
                 continue
 
-            if evt.get("type") == "function_call_output":
-                base = call_bases.get(evt.get("call_id") or "")
-                _remember(_paths_from_result_output(evt.get("output"), base))
+            fco = _extract_function_call_output(evt)
+            if fco is not None:
+                call_id, out = fco
+                base = call_bases.get(call_id) or rollout_cwd
+                _remember(_paths_from_result_output(out, base))
                 continue
 
             # Also handle chat-completions leftover shape (message with tool_calls)
@@ -328,8 +455,9 @@ def scan_rollout(session_path: Optional[Path] = None) -> List[str]:
                     call_id = tc.get("id") or tc.get("call_id") or ""
                     paths, base = _paths_from_function_call(name, args_raw)
                     _remember(paths)
-                    if call_id and base:
-                        call_bases[call_id] = base
+                    effective_base = base or rollout_cwd
+                    if call_id and effective_base:
+                        call_bases[call_id] = effective_base
 
     return ordered
 
