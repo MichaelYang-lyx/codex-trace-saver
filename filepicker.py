@@ -72,6 +72,21 @@ def _too_big(path: Path, max_bytes: int) -> bool:
         return False
 
 
+_MAX_REASONABLE_PATH_LEN = 512  # POSIX PATH_MAX is 4096, but real files rarely exceed this
+
+
+def _safe_exists_is_file(p: Path) -> bool:
+    """``Path.exists()`` / ``is_file()`` raise OSError on ENAMETOOLONG etc.
+
+    Treat every such failure as \"file not usable\" — the whole point of the
+    filter is to drop candidates we can't or shouldn't touch.
+    """
+    try:
+        return p.exists() and p.is_file()
+    except OSError:
+        return False
+
+
 def filter_paths(paths: Iterable[Path],
                  max_size_bytes: int = DEFAULT_MAX_SIZE_BYTES,
                  ) -> Tuple[List[Path], List[Tuple[Path, str]]]:
@@ -84,6 +99,12 @@ def filter_paths(paths: Iterable[Path],
         except Exception:
             rejected.append((Path(str(raw)), "bad path"))
             continue
+        # Drop obvious junk before any stat() — scanners can grab huge
+        # sentences with slashes in them (e.g. skill instructions with
+        # "using /path/to/x" phrasing) that would blow up filesystem calls.
+        if len(str(p)) > _MAX_REASONABLE_PATH_LEN:
+            rejected.append((Path(str(p)[:80] + "…"), "path too long (>512 chars)"))
+            continue
         try:
             resolved = p.resolve()
         except (OSError, RuntimeError):
@@ -91,7 +112,7 @@ def filter_paths(paths: Iterable[Path],
         if resolved in seen:
             continue
         seen.add(resolved)
-        if not p.exists() or not p.is_file():
+        if not _safe_exists_is_file(p):
             rejected.append((p, "missing or not a regular file"))
             continue
         if _in_excluded_dir(p):
