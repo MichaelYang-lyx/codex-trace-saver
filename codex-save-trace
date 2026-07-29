@@ -76,6 +76,7 @@ def _parse_args(argv):
         "session": "latest", "name": None, "note": "", "yes": False,
         "local": False, "out_dir": None, "no_files": False,
         "exclude": [], "add": [], "only": [], "help": False, "list_n": None,
+        "verbose": False,
     }
     positionals = []
     i = 0
@@ -90,6 +91,8 @@ def _parse_args(argv):
             opts["list_n"] = max(1, min(int(tok), 100))
         elif tok in ("--yes", "-y"):
             opts["yes"] = True
+        elif tok in ("--verbose", "-v"):
+            opts["verbose"] = True
         elif tok in ("--local", "-l"):
             opts["local"] = True
         elif tok in ("--no-files", "--trace-only"):
@@ -189,8 +192,47 @@ def _apply_tweaks(kept, excludes, adds, onlys):
     return final, changes
 
 
-def _format_bundle_preview(session_path, kept, rejected, changes):
+def _peek_file(p: Path, max_bytes: int = 80) -> str:
+    """Return a short human-readable content preview: text head or binary size."""
+    try:
+        size = p.stat().st_size
+    except OSError:
+        return "(unreadable)"
+    if size == 0:
+        return "(empty)"
+    try:
+        with p.open("rb") as fh:
+            head = fh.read(max_bytes)
+    except OSError:
+        return "(unreadable)"
+    # Detect binary — any NUL byte or a lot of non-printable
+    if b"\x00" in head or sum(b < 9 or (b > 13 and b < 32) for b in head) > len(head) * 0.3:
+        return f"[binary, {_fmt_size(size)}]"
+    try:
+        text = head.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = head.decode("gbk")
+        except UnicodeDecodeError:
+            return f"[binary/unknown, {_fmt_size(size)}]"
+    text = text.replace("\n", " ⏎ ").replace("\t", " ")
+    if size > max_bytes:
+        text = text.rstrip() + " …"
+    return text
+
+
+def _fmt_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n} B"
+
+
+def _format_bundle_preview(session_path, kept, rejected, changes, verbose=False):
     lines = []
+
+    # ---- Rollout line ----
     if session_path is not None:
         sp_str = str(session_path)
         env_file = os.environ.get("CODEX_SESSION_FILE", "").strip()
@@ -203,23 +245,40 @@ def _format_bundle_preview(session_path, kept, rejected, changes):
         else:
             tag = "最新 rollout (按 mtime)"
         lines.append(f"rollout: {session_path.name}  [{tag}]")
+
+    # ---- Files that WILL be uploaded (headline section) ----
     total = sum(_safe_stat(p) for p in kept)
-    lines.append(f"attach files: {len(kept)} file(s), ~{total / 1024:.1f} KB")
-    for p in kept:
-        lines.append(f"  ✓ {p}  ({_safe_stat(p)} B)")
-    if rejected:
-        lines.append(f"skipped     : {len(rejected)} file(s)")
-        for p, why in rejected[:20]:
-            lines.append(f"  ✗ {p}  — {why}")
-        if len(rejected) > 20:
-            lines.append(f"  ... and {len(rejected) - 20} more")
+    lines.append("")
+    lines.append(f"═══ 会上传 {len(kept)} 个文件, 共 {_fmt_size(total)} ═══")
+    if not kept:
+        lines.append("  (会话里没有任何本地文件被读/写)")
+    else:
+        for p in kept:
+            lines.append(f"  ✓ {p}  ({_fmt_size(_safe_stat(p))})")
+            lines.append(f"      → {_peek_file(p)}")
+
+    # ---- Tweak changes (if any) ----
     if changes:
-        lines.append("tweaks:")
+        lines.append("")
+        lines.append("─── 应用的微调 ───")
         for marker, p, reason in changes:
             lines.append(f"  {marker} {p}  — {reason}")
+
+    # ---- Skipped (collapsed by default — usually noise from tool outputs) ----
+    if rejected:
+        lines.append("")
+        if verbose:
+            lines.append(f"─── 跳过的候选 {len(rejected)} 个 ───")
+            for p, why in rejected:
+                lines.append(f"  ✗ {p}  — {why}")
+        else:
+            lines.append(f"跳过的候选: {len(rejected)} 个 (加 -v 查看详情)")
+
     lines.append("")
-    lines.append("Add --yes to upload  (or --yes --local to save the zip locally).")
-    lines.append("Tweak: -x <pat> drop / -a <path> add / --only <pat> / --no-files.")
+    lines.append("下一步:")
+    lines.append("  codex-save-trace --yes            上传到排行榜 (+1)")
+    lines.append("  codex-save-trace --yes --local    只打成 zip 存到 ~/codex-traces/")
+    lines.append("  微调: -x <pat> 排除 | -a <path> 追加 | --only <pat> 白名单 | --no-files 只传 rollout")
     return "\n".join(lines)
 
 
@@ -305,7 +364,8 @@ def main(argv=None):
                     "Add --yes to upload  (or --yes --local to save locally)."
                 )
                 return 0
-            print(_format_bundle_preview(session_path, kept, rejected, changes))
+            print(_format_bundle_preview(session_path, kept, rejected, changes,
+                                         verbose=opts["verbose"]))
             return 0
 
         extra = [str(p) for p in kept]
