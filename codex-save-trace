@@ -84,6 +84,13 @@ def _parse_args(argv):
     i = 0
     while i < len(argv):
         tok = argv[i]
+        # Normalize common single-dash long flags to double-dash — users
+        # (and non-shell shells) frequently write `-pick` where `--pick` was
+        # meant. Silently accept, so `codex-save-trace -pick` works too.
+        if tok in ("-pick", "-yes", "-local", "-verbose", "-no-files",
+                   "-trace-only", "-help", "-name", "-note", "-out",
+                   "-out-dir", "-exclude", "-add", "-only", "-drop"):
+            tok = "-" + tok  # -pick -> --pick
         if tok in ("help", "-h", "--help"):
             opts["help"] = True
             return opts

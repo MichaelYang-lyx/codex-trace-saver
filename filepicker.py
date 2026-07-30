@@ -175,6 +175,21 @@ def _extract_named_files(haystack: str) -> List[str]:
     # 1) absolute paths anywhere
     for m in _ABS_OR_HOME_PATH_RE.findall(haystack):
         out.append(m)
+    # 1a) codex apply_patch protocol: shell input contains a heredoc like
+    #     "*** Begin Patch\n*** Add File: /some/path\n+content\n*** End Patch"
+    #     Grab paths from every `*** {Add,Update,Delete,Move} File:` marker.
+    #     The marker line ends at the next newline (literal or escaped \n),
+    #     never at whitespace inside the filename — CJK names contain none.
+    for m in re.findall(
+        r"\*\*\*\s*(?:Add|Update|Delete|Move)\s+File\s*:\s*([^\r\n\\\"]+)",
+        haystack,
+    ):
+        p = m.strip()
+        # Drop trailing '-> new-path' from Move markers (keep new path only)
+        if " -> " in p:
+            p = p.split(" -> ", 1)[1].strip()
+        if p:
+            out.append(p)
     # 1b) If the haystack is codex v0.146 JS wrapping shell, extract the
     #     inner shell command from `cmd:"..."` so we can tokenise real args.
     inner_cmds: List[str] = []
