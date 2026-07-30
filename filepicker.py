@@ -159,16 +159,63 @@ _BAREFILE_LINE_RE = re.compile(
 def _extract_named_files(haystack: str) -> List[str]:
     """Pull file-like tokens from shell input / output text.
 
-    Combines three signals:
-      * absolute / home paths (existing regex)
-      * quoted names with a file extension (e.g. p='foo.xlsx')
-      * bare filenames on their own line (e.g. ls output)
+    Strategy: tokenise the haystack (shlex when possible; word-split
+    fallback) and keep every token that looks like a filename (has a
+    short extension). This gets `root.txt` out of
+    ``sed -n '1,200p' root.txt`` and `sub/nested.txt` intact — but does
+    NOT get confused by JS wrapper syntax like
+    ``tools.exec_command({cmd:"..."})`` because those are non-file tokens
+    that lack a plain extension.
+
+    Also keeps the historical signals:
+      * absolute / home paths
+      * bare filenames on their own line (ls-style output)
     """
     out: List[str] = []
+    # 1) absolute paths anywhere
     for m in _ABS_OR_HOME_PATH_RE.findall(haystack):
         out.append(m)
-    for m in _QUOTED_FILE_RE.findall(haystack):
-        out.append(m)
+    # 1b) If the haystack is codex v0.146 JS wrapping shell, extract the
+    #     inner shell command from `cmd:"..."` so we can tokenise real args.
+    inner_cmds: List[str] = []
+    for m in re.findall(r'\bcmd\s*:\s*"((?:[^"\\]|\\.)*)"', haystack):
+        try:
+            inner_cmds.append(bytes(m, "utf-8").decode("unicode_escape"))
+        except UnicodeDecodeError:
+            inner_cmds.append(m)
+    if not inner_cmds:
+        inner_cmds = [haystack]
+
+    # 2) token-level: split on whitespace/shell separators, then check each
+    #    token for `.ext`. Robust against embedded quotes / brackets.
+    #    Try shlex first (respects quotes); on ValueError (unbalanced),
+    #    fall back to a regex word split.
+    for cmd in inner_cmds:
+        tokens: List[str] = []
+        try:
+            tokens = shlex.split(cmd, posix=True)
+        except ValueError:
+            tokens = re.split(r"[\s,\(\){}\[\]<>|&;]+", cmd)
+        # A file-ish token: has an extension of 1-8 chars, doesn't start with a
+        # dash (flag), and doesn't contain spaces after tokenisation. Length
+        # ≤ 255 rules out huge sentences that regex-split failed to break up.
+        for tok in tokens:
+            t = tok.strip().strip("'\"`")
+            if not t or len(t) > 255:
+                continue
+            if t.startswith("-"):
+                continue
+            m = re.search(r"\.[A-Za-z0-9]{1,8}$", t)
+            if not m:
+                continue
+            # Skip obvious url / http hosts
+            if t.startswith(("http:", "https:", "ftp:", "//")):
+                continue
+            # Skip pure version tokens like "1.2.3" (no letters after dots)
+            if re.fullmatch(r"[\d.]+", t):
+                continue
+            out.append(t)
+    # 3) bare filename lines (ls-style output)
     for line in haystack.splitlines():
         ln = line.strip()
         m = _BAREFILE_LINE_RE.match(ln)
@@ -515,6 +562,43 @@ def scan_rollout(session_path: Optional[Path] = None) -> List[str]:
                         call_bases[call_id] = effective_base
 
     return ordered
+
+
+def scan_rollout_with_cwd(session_path: Optional[Path] = None,
+                          ) -> Tuple[List[str], Optional[str]]:
+    """Same as :func:`scan_rollout` but also returns the rollout's declared cwd.
+
+    Reads the rollout twice would be wasteful; we replay the same loop here
+    so callers that need the cwd (e.g. to build cwd-relative arcnames in
+    the zip) don't have to re-parse the file themselves.
+    """
+    if session_path is None:
+        session_path = uploader.current_session_file()
+    if session_path is None:
+        raise FileNotFoundError(
+            f"No Codex rollout found under {uploader.sessions_dir()}"
+        )
+
+    paths = scan_rollout(session_path)
+
+    cwd: Optional[str] = None
+    try:
+        with open(session_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                declared = _extract_turn_cwd(evt) if isinstance(evt, dict) else None
+                if declared:
+                    cwd = declared  # keep the LAST one — most recent turn wins
+    except OSError:
+        pass
+
+    return paths, cwd
 
 
 def _resolve_relative_paths(paths: List[str], base: Optional[str]) -> List[str]:

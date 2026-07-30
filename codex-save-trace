@@ -309,8 +309,10 @@ def _format_rollout_list(files, limit):
     return "\n".join(lines)
 
 
-def _scan_and_filter():
-    session_path = uploader.current_session_file()
+def _scan_and_filter(session_path=None):
+    """Scan a specific rollout; default to the live/current one."""
+    if session_path is None:
+        session_path = uploader.current_session_file()
     if session_path is None:
         raise FileNotFoundError(
             f"No Codex rollout found under {uploader.sessions_dir()}"
@@ -318,6 +320,25 @@ def _scan_and_filter():
     raw = filepicker.scan_rollout(session_path)
     kept, rejected = filepicker.filter_paths([Path(p) for p in raw])
     return kept, rejected, session_path
+
+
+def _scan_all_sessions(rollouts):
+    """Return (files_by_session, per_session_display) for a list of rollouts.
+
+    files_by_session: {sid: [Path...]} for save_trace_bundle
+    per_session_display: [(rollout_path, kept, rejected, changes)] for preview
+    """
+    files_by_session = {}
+    display = []
+    for r in rollouts:
+        try:
+            kept, rejected, _ = _scan_and_filter(r)
+        except Exception as exc:
+            display.append((r, [], [(Path("?"), str(exc))], []))
+            continue
+        files_by_session[uploader._sid_from_rollout(r)] = kept
+        display.append((r, kept, rejected, []))
+    return files_by_session, display
 
 
 def main(argv=None):
@@ -344,7 +365,40 @@ def main(argv=None):
     out_dir = opts["out_dir"]
 
     try:
-        # Attached files
+        # ---- multi-session (`all`) path ----
+        if session.strip().lower() in ("all", "*") and not opts["no_files"]:
+            rollouts = uploader.list_rollouts()
+            if not rollouts:
+                return _err("No Codex rollouts found.")
+            files_by_session, display = _scan_all_sessions(rollouts)
+            if not yes:
+                lines = [f"══ 会打包 {len(rollouts)} 个 session ══", ""]
+                for rollout, kept, rejected, _ in display:
+                    total = sum(_safe_stat(p) for p in kept)
+                    lines.append(f"● {rollout.name}")
+                    lines.append(f"    {len(kept)} 个文件, {_fmt_size(total)}, "
+                                 f"跳过 {len(rejected)}")
+                    for p in kept[:5]:
+                        lines.append(f"      ✓ {p}")
+                    if len(kept) > 5:
+                        lines.append(f"      … 还有 {len(kept)-5} 个")
+                lines.append("")
+                lines.append("下一步:")
+                lines.append("  codex-save-trace --yes all         上传全部")
+                lines.append("  codex-save-trace --yes all --local 只本地打包")
+                print("\n".join(lines))
+                return 0
+            res = uploader.save_trace_bundle(
+                session=session, name=name, note=note,
+                files_by_session={sid: [str(p) for p in files]
+                                  for sid, files in files_by_session.items()},
+                local=local, out_dir=out_dir,
+            )
+            icon = "💾" if res.get("mode") == "local" else "📤"
+            print(f"{icon} {res['message']}")
+            return 0
+
+        # ---- single-session path (default) ----
         kept, rejected, changes, session_path = [], [], [], None
         if not opts["no_files"]:
             scanned, rejected, session_path = _scan_and_filter()

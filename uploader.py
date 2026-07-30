@@ -190,17 +190,73 @@ def codex_cwd() -> Optional[Path]:
 # --------------------------------------------------------------------------- #
 # Zip packaging
 # --------------------------------------------------------------------------- #
-def build_combined_zip(session_files: List[Path], extra_files: List[Path],
+def _sid_from_rollout(rollout: Path) -> str:
+    """Extract the codex session id from a rollout filename.
+
+    Filenames look like ``rollout-2026-07-29T18-26-53-019fad69-b302-...jsonl``.
+    We take everything after the timestamp, drop the .jsonl. If the pattern
+    doesn't match, fall back to the stem so we always have SOME id.
+    """
+    stem = rollout.stem
+    if not stem.startswith("rollout-"):
+        return _safe(stem, "session")
+    rest = stem[len("rollout-"):]
+    parts = rest.split("-", 6)  # timestamp uses first 6 dash groups
+    tail = parts[-1] if len(parts) >= 7 else rest
+    return _safe(tail, "session")
+
+
+def _arcname_for_file(source: Path, session_cwd: Optional[str]) -> str:
+    """Compute the in-zip path for a source file, preserving hierarchy.
+
+    Layout choice: cwd-relative when possible, absolute-tree fallback when not.
+
+    * File is inside ``session_cwd``: strip that prefix, keep the rest.
+      e.g. cwd=/data/project/foo, source=/data/project/foo/sub/bar.xlsx
+           → files/sub/bar.xlsx
+    * File is outside cwd (or no cwd known): drop the leading '/' and keep
+      the full absolute tree so the receiver can reproduce it.
+      e.g. source=/tmp/other/x.txt → files/_abs/tmp/other/x.txt
+    """
+    try:
+        src = source.resolve()
+    except OSError:
+        src = source
+    if session_cwd:
+        try:
+            cwd_p = Path(session_cwd).expanduser().resolve()
+            rel = src.relative_to(cwd_p)
+            return f"files/{rel.as_posix()}"
+        except (ValueError, OSError):
+            pass
+    # Fallback: absolute tree under files/_abs/
+    abs_str = str(src).lstrip("/")
+    return f"files/_abs/{abs_str}"
+
+
+def build_combined_zip(session_bundles: List[dict],
                        name: str, label: str = "latest", note: str = "",
                        now: Optional[datetime] = None,
                        out_dir: Optional[Path] = None) -> Path:
-    """Zip Codex rollout(s) + extra work files into one archive.
+    """Zip one-or-more Codex sessions + their attached files.
+
+    Each ``session_bundles`` entry is a dict::
+
+        {
+            "rollout": Path(...),      # required — the rollout .jsonl
+            "files":   [Path, ...],    # attached work files for this session
+            "cwd":     "..." | None,   # session's cwd (for rel-path arcnames)
+        }
 
     Layout::
 
         manifest.json
-        sessions/rollout-<uuid>.jsonl
-        files/<basename>
+        sessions/<sid>/rollout.jsonl
+        sessions/<sid>/files/<cwd-rel-or-_abs-path>
+
+    Each session gets its own directory so a multi-session archive stays
+    unambiguous — a file `data.txt` appearing in two sessions doesn't
+    collide, and the receiver can regenerate the original layout.
     """
     now = now or datetime.now()
     ts = now.strftime("%Y%m%d_%H%M%S")
@@ -213,40 +269,59 @@ def build_combined_zip(session_files: List[Path], extra_files: List[Path],
         target_dir.mkdir(parents=True, exist_ok=True)
     zip_path = target_dir / zip_name
 
-    used: dict = {}
-    file_entries: List[dict] = []
+    manifest_sessions: List[dict] = []
+    total_files = 0
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for f in session_files:
-            f = Path(f)
-            if f.exists():
-                zf.write(f, arcname=f"sessions/{f.name}")
-        for f in extra_files:
-            f = Path(f)
-            if not f.exists() or not f.is_file():
+        for bundle in session_bundles:
+            rollout: Path = Path(bundle["rollout"])
+            if not rollout.exists():
                 continue
-            base = f.name or "unnamed"
-            if base in used:
-                used[base] += 1
-                stem, dot, ext = base.rpartition(".")
-                base = (f"{stem}__{used[base]}.{ext}" if dot
-                        else f"{base}__{used[base]}")
-            else:
-                used[base] = 0
-            arc = f"files/{base}"
-            zf.write(f, arcname=arc)
-            file_entries.append({"arcname": arc, "source": str(f),
-                                 "size": f.stat().st_size})
+            sid = _sid_from_rollout(rollout)
+            cwd = bundle.get("cwd")
+            # Rollout jsonl -> sessions/<sid>/rollout.jsonl
+            zf.write(rollout, arcname=f"sessions/{sid}/rollout.jsonl")
+
+            files_manifest: List[dict] = []
+            # Track arcnames within THIS session to dedup collisions
+            used: dict = {}
+            for f in bundle.get("files") or []:
+                fp = Path(f)
+                if not fp.exists() or not fp.is_file():
+                    continue
+                rel_arc = _arcname_for_file(fp, cwd)
+                arc = f"sessions/{sid}/{rel_arc}"
+                if arc in used:
+                    used[arc] += 1
+                    stem, dot, ext = arc.rpartition(".")
+                    arc = f"{stem}__{used[arc]}.{ext}" if dot else f"{arc}__{used[arc]}"
+                else:
+                    used[arc] = 0
+                zf.write(fp, arcname=arc)
+                files_manifest.append({
+                    "arcname": arc,
+                    "source": str(fp),
+                    "size": fp.stat().st_size,
+                })
+                total_files += 1
+
+            manifest_sessions.append({
+                "session_id": sid,
+                "rollout_file": rollout.name,
+                "cwd": cwd,
+                "file_count": len(files_manifest),
+                "files": files_manifest,
+            })
 
         manifest = {
             "kind": "codex-trace+files",
+            "layout_version": 2,
             "board_name": name,
             "selector": label,
             "created_at": now.astimezone().isoformat(),
             "note": note or "",
-            "session_count": len([f for f in session_files if Path(f).exists()]),
-            "sessions": [Path(f).name for f in session_files if Path(f).exists()],
-            "file_count": len(file_entries),
-            "files": file_entries,
+            "session_count": len(manifest_sessions),
+            "file_count": total_files,
+            "sessions": manifest_sessions,
         }
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
     return zip_path
@@ -362,35 +437,79 @@ def upload_zip(zip_path: Path, name: str, base_url: Optional[str] = None,
 # --------------------------------------------------------------------------- #
 # Top-level entry point (called by the CLI)
 # --------------------------------------------------------------------------- #
-def save_trace_bundle(session: str = "latest", extra_files: Optional[List[Path]] = None,
+def save_trace_bundle(session: str = "latest",
+                      extra_files: Optional[List[Path]] = None,
+                      files_by_session: Optional[dict] = None,
                       name: Optional[str] = None, note: str = "",
                       base_url: Optional[str] = None,
                       local: bool = False, out_dir: Optional[str] = None) -> dict:
+    """Bundle codex rollout(s) + touched files into a zip; upload or save locally.
+
+    Two ways to specify attached files:
+
+    * ``files_by_session={sid_or_rollout_name: [Path, ...]}`` — preferred.
+      Each session gets its own file list in the zip.
+    * ``extra_files=[Path, ...]`` — legacy flat list. Attached to the
+      first resolved session; useful for single-session use.
+    """
     name = (name or default_name()).strip()
     if not name:
         raise ValueError("board name is empty; set TRACE_LEADERBOARD_NAME")
-    extra_files = [Path(f) for f in (extra_files or [])]
 
     session_files, label = resolve_sessions(session)
 
+    # Build the per-session bundles the new build_combined_zip expects.
+    bundles: List[dict] = []
+    fbs = dict(files_by_session or {})
+    flat_extras = [Path(f) for f in (extra_files or [])]
+    for i, rollout in enumerate(session_files):
+        # Match a file group by session-id, then by rollout filename, else
+        # dump flat extras on the first (or only) session.
+        sid = _sid_from_rollout(rollout)
+        files: List[Path] = []
+        for key in (sid, rollout.name, rollout.stem):
+            if key in fbs:
+                files = [Path(f) for f in fbs.pop(key)]
+                break
+        if not files and i == 0 and flat_extras:
+            files = flat_extras
+            flat_extras = []
+        # Pull the rollout's own cwd for cwd-relative arcnames
+        try:
+            from . import filepicker  # type: ignore[attr-defined]
+        except ImportError:
+            import filepicker  # type: ignore[no-redef]
+        try:
+            _, cwd = filepicker.scan_rollout_with_cwd(rollout)
+        except Exception:
+            cwd = None
+        bundles.append({"rollout": rollout, "files": files, "cwd": cwd})
+
+    # If leftover keyed entries reference sessions not in resolve() (edge case),
+    # fold them into the first bundle so nothing gets silently dropped.
+    if fbs and bundles:
+        for _sid, files in fbs.items():
+            bundles[0]["files"].extend(Path(f) for f in files)
+
+    total_files = sum(len(b["files"]) for b in bundles)
+
     if local:
         target_dir = Path(out_dir).expanduser() if out_dir else default_save_dir()
-        zip_path = build_combined_zip(session_files, extra_files, name=name,
-                                      label=label, note=note, out_dir=target_dir)
+        zip_path = build_combined_zip(bundles, name=name, label=label, note=note,
+                                      out_dir=target_dir)
         size = zip_path.stat().st_size
         return {
             "success": True, "mode": "local", "name": name, "selector": label,
-            "sessions_saved": len(session_files), "files_saved": len(extra_files),
+            "sessions_saved": len(bundles), "files_saved": total_files,
             "zip_bytes": size, "zip_path": str(zip_path),
             "message": (
-                f"Saved rollout + {len(extra_files)} file(s) locally as '{name}' "
-                f"({size / 1024:.1f} KB) -> {zip_path}"
+                f"Saved {len(bundles)} session(s) + {total_files} file(s) locally "
+                f"as '{name}' ({size / 1024:.1f} KB) -> {zip_path}"
             ),
         }
 
     base_url = (base_url or leaderboard_url()).rstrip("/")
-    zip_path = build_combined_zip(session_files, extra_files, name=name,
-                                  label=label, note=note)
+    zip_path = build_combined_zip(bundles, name=name, label=label, note=note)
     try:
         size = zip_path.stat().st_size
         status = upload_zip(zip_path, name, base_url=base_url)
@@ -403,11 +522,11 @@ def save_trace_bundle(session: str = "latest", extra_files: Optional[List[Path]]
 
     return {
         "success": True, "mode": "upload", "name": name, "selector": label,
-        "sessions_uploaded": len(session_files), "files_uploaded": len(extra_files),
+        "sessions_uploaded": len(bundles), "files_uploaded": total_files,
         "zip_bytes": size, "http_status": status, "leaderboard": base_url,
         "user_page": f"{base_url}/u/{name}",
         "message": (
-            f"Uploaded rollout + {len(extra_files)} file(s) as '{name}' "
+            f"Uploaded {len(bundles)} session(s) + {total_files} file(s) as '{name}' "
             f"({size / 1024:.1f} KB). See {base_url}/u/{name}"
         ),
     }
