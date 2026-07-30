@@ -139,10 +139,21 @@ codex-save-trace --yes --local
 # → 存到 ~/codex-traces/ (可用 TRACE_SAVE_DIR 覆盖)
 ```
 
-**上传别的 rollout(不是最新的)**:先看列表,再指定 id 片段:
+**上传别的 rollout(不是最新的)** — 两种方式:
+
+**方式 1(推荐):`--pick` 交互式选择**
 ```
-codex-save-trace list
-codex-save-trace --yes 019face3        # 只需要 id 片段能唯一识别就行
+codex-save-trace --pick               # 弹出菜单选一个 → 预览
+codex-save-trace --pick --yes         # 弹出菜单选一个 → 直接上传
+codex-save-trace --pick --yes --local # 选中后打包到本地
+```
+
+菜单里每行显示 **时间 · 大小 · cwd · 消息数 · 首个 user 问句**,一眼认出这个 session 是聊什么的。真终端下 ↑/↓ 或 j/k 移动、Enter 确认、q/Esc 取消;管道场景自动 fallback 到数字选择。
+
+**方式 2:手动看 list + 指定 id 片段**
+```
+codex-save-trace list                    # 看最近的 rollouts
+codex-save-trace --yes 019face3          # id 片段能唯一识别就行
 ```
 
 ---
@@ -164,13 +175,16 @@ Codex 没有斜杠命令,但 agent 能跑 shell。在会话里直接说:
 | 预览会传什么 | `codex-save-trace` |
 | 确认上传 | `codex-save-trace --yes` |
 | 只存本地,不上传 | `codex-save-trace --yes --local` |
+| **交互式选一个 rollout** | `codex-save-trace --pick` / `--pick --yes` |
 | 列出最近 rollout | `codex-save-trace list` |
 | 上传指定 rollout | `codex-save-trace --yes <id-片段>` |
+| 打包全部 rollout | `codex-save-trace --yes all` |
 | 排除某文件 | `codex-save-trace --yes -x <名/glob>` |
 | 追加某文件 | `codex-save-trace --yes -a <路径>` |
 | 只要某类文件 | `codex-save-trace --yes --only <glob>` |
 | 只传 trace 不带文件 | `codex-save-trace --yes --no-files` |
 | 加备注 | `codex-save-trace --yes -n "本周实验"` |
+| 详细模式(显示跳过) | `codex-save-trace -v` |
 | 完整帮助 | `codex-save-trace --help` |
 
 ---
