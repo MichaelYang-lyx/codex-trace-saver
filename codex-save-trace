@@ -62,6 +62,8 @@ Trace-only / attach-file tweaks (use with --yes):
 
 Utilities:
   codex-save-trace list [N]                list N (default 15) recent rollouts
+  codex-save-trace --pick                  interactively pick a rollout (↑/↓ + Enter)
+  codex-save-trace --pick --yes            pick + upload right away
 
 Env (all optional):
   TRACE_LEADERBOARD_NAME   your display name on the board (default: system user)
@@ -76,7 +78,7 @@ def _parse_args(argv):
         "session": "latest", "name": None, "note": "", "yes": False,
         "local": False, "out_dir": None, "no_files": False,
         "exclude": [], "add": [], "only": [], "help": False, "list_n": None,
-        "verbose": False,
+        "verbose": False, "pick": False,
     }
     positionals = []
     i = 0
@@ -93,6 +95,8 @@ def _parse_args(argv):
             opts["yes"] = True
         elif tok in ("--verbose", "-v"):
             opts["verbose"] = True
+        elif tok in ("--pick", "-p"):
+            opts["pick"] = True
         elif tok in ("--local", "-l"):
             opts["local"] = True
         elif tok in ("--no-files", "--trace-only"):
@@ -341,6 +345,129 @@ def _scan_all_sessions(rollouts):
     return files_by_session, display
 
 
+def _rollout_meta(rollout: Path) -> dict:
+    """Cheap meta for the picker: mtime, size, cwd, msg count, first user prompt."""
+    import json as _json
+    from datetime import datetime as _dt
+    meta = {
+        "path": rollout,
+        "name": rollout.name,
+        "mtime": "?",
+        "size": "?",
+        "cwd": "",
+        "n_user": 0,
+        "first_prompt": "",
+    }
+    try:
+        st = rollout.stat()
+        meta["mtime"] = _dt.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+        meta["size"] = _fmt_size(st.st_size)
+    except OSError:
+        pass
+    try:
+        with rollout.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = _json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                p = evt.get("payload") if isinstance(evt, dict) else None
+                if not isinstance(p, dict):
+                    continue
+                if evt.get("type") in ("session_meta", "turn_context"):
+                    if not meta["cwd"] and isinstance(p.get("cwd"), str):
+                        meta["cwd"] = p["cwd"]
+                if p.get("type") == "user_message":
+                    meta["n_user"] += 1
+                    if not meta["first_prompt"]:
+                        msg = p.get("message") or ""
+                        meta["first_prompt"] = msg[:80].replace("\n", " ")
+    except OSError:
+        pass
+    return meta
+
+
+def _pick_rollout(rollouts):
+    """Interactive selector — curses when TTY, numeric prompt otherwise.
+
+    Returns the selected rollout Path, or None if the user aborts.
+    """
+    if not rollouts:
+        return None
+    metas = [_rollout_meta(r) for r in rollouts[:50]]
+
+    def _row(i, m, selected=False):
+        prefix = "▶ " if selected else "  "
+        return (
+            f"{prefix}[{i+1:>2}] {m['mtime']}  {m['size']:>8}  "
+            f"{m['cwd'][-40:]:<40}  msgs={m['n_user']:<2}  {m['first_prompt']}"
+        )
+
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            return _pick_curses(rollouts, metas, _row)
+        except Exception:
+            pass  # fall through to numeric prompt
+
+    # Non-TTY fallback: print table + read a number from stdin
+    print("请选择要保存的 rollout(输入序号,回车确认;q 取消):")
+    for i, m in enumerate(metas):
+        print(_row(i, m))
+    try:
+        raw = input("\n序号> ").strip()
+    except EOFError:
+        return None
+    if raw in ("", "q", "Q"):
+        return None
+    if raw.isdigit():
+        idx = int(raw) - 1
+        if 0 <= idx < len(metas):
+            return metas[idx]["path"]
+    return None
+
+
+def _pick_curses(rollouts, metas, row_fn):
+    """curses-based picker: ↑/↓ or j/k to move, enter to pick, q/esc to abort."""
+    import curses
+    def _run(stdscr):
+        curses.curs_set(0)
+        idx = 0
+        top = 0
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            header = "选择 rollout:  ↑/↓ 或 j/k 移动, Enter 选中, q 取消"
+            stdscr.addnstr(0, 0, header, w - 1, curses.A_BOLD)
+            visible = h - 2
+            if idx < top:
+                top = idx
+            elif idx >= top + visible:
+                top = idx - visible + 1
+            for row_i in range(min(visible, len(metas) - top)):
+                m_i = top + row_i
+                line = row_fn(m_i, metas[m_i], selected=(m_i == idx))
+                attr = curses.A_REVERSE if m_i == idx else curses.A_NORMAL
+                stdscr.addnstr(1 + row_i, 0, line, w - 1, attr)
+            stdscr.refresh()
+            k = stdscr.getch()
+            if k in (curses.KEY_UP, ord("k")):
+                idx = max(0, idx - 1)
+            elif k in (curses.KEY_DOWN, ord("j")):
+                idx = min(len(metas) - 1, idx + 1)
+            elif k in (curses.KEY_HOME, ord("g")):
+                idx = 0
+            elif k in (curses.KEY_END, ord("G")):
+                idx = len(metas) - 1
+            elif k in (curses.KEY_ENTER, 10, 13):
+                return metas[idx]["path"]
+            elif k in (ord("q"), 27):  # q or ESC
+                return None
+    return curses.wrapper(_run)
+
+
 def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
     try:
@@ -363,6 +490,19 @@ def main(argv=None):
     yes = opts["yes"]
     local = opts["local"]
     out_dir = opts["out_dir"]
+
+    # --pick: interactive rollout selection. Overrides `session` with a
+    # picked rollout id, then falls through to the normal flow.
+    if opts["pick"]:
+        rollouts = uploader.list_rollouts()
+        if not rollouts:
+            return _err(f"No Codex rollouts found under {uploader.sessions_dir()}")
+        picked = _pick_rollout(rollouts)
+        if picked is None:
+            print("(picker cancelled)")
+            return 0
+        session = uploader._sid_from_rollout(picked)
+        print(f"选中: {picked.name}\n")
 
     try:
         # ---- multi-session (`all`) path ----
