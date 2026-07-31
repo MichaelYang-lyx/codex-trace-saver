@@ -178,7 +178,8 @@ Codex 没有斜杠命令,但 agent 能跑 shell。在会话里直接说:
 | **交互式选一个 rollout** | `codex-save-trace --pick` / `--pick --yes` |
 | 列出最近 rollout | `codex-save-trace list` |
 | 上传指定 rollout | `codex-save-trace --yes <id-片段>` |
-| 打包全部 rollout | `codex-save-trace --yes all` |
+| 打包全部 rollout(一个 zip、+1) | `codex-save-trace --yes all` |
+| 打包全部 rollout(每个 +1) | `codex-save-trace --yes all --split` |
 | 排除某文件 | `codex-save-trace --yes -x <名/glob>` |
 | 追加某文件 | `codex-save-trace --yes -a <路径>` |
 | 只要某类文件 | `codex-save-trace --yes --only <glob>` |

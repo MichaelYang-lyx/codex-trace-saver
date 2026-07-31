@@ -64,6 +64,8 @@ Utilities:
   codex-save-trace list [N]                list N (default 15) recent rollouts
   codex-save-trace --pick                  interactively pick a rollout (↑/↓ + Enter)
   codex-save-trace --pick --yes            pick + upload right away
+  codex-save-trace --yes all               bundle all rollouts into ONE zip (+1)
+  codex-save-trace --yes all --split       one zip per rollout, each scores +1
 
 Env (all optional):
   TRACE_LEADERBOARD_NAME   your display name on the board (default: system user)
@@ -78,7 +80,7 @@ def _parse_args(argv):
         "session": "latest", "name": None, "note": "", "yes": False,
         "local": False, "out_dir": None, "no_files": False,
         "exclude": [], "add": [], "only": [], "help": False, "list_n": None,
-        "verbose": False, "pick": False,
+        "verbose": False, "pick": False, "split": False,
     }
     positionals = []
     i = 0
@@ -89,7 +91,8 @@ def _parse_args(argv):
         # meant. Silently accept, so `codex-save-trace -pick` works too.
         if tok in ("-pick", "-yes", "-local", "-verbose", "-no-files",
                    "-trace-only", "-help", "-name", "-note", "-out",
-                   "-out-dir", "-exclude", "-add", "-only", "-drop"):
+                   "-out-dir", "-exclude", "-add", "-only", "-drop",
+                   "-split"):
             tok = "-" + tok  # -pick -> --pick
         if tok in ("help", "-h", "--help"):
             opts["help"] = True
@@ -104,6 +107,8 @@ def _parse_args(argv):
             opts["verbose"] = True
         elif tok in ("--pick", "-p"):
             opts["pick"] = True
+        elif tok in ("--split",):
+            opts["split"] = True
         elif tok in ("--local", "-l"):
             opts["local"] = True
         elif tok in ("--no-files", "--trace-only"):
@@ -526,7 +531,8 @@ def main(argv=None):
                 return _err("No Codex rollouts found.")
             files_by_session, display = _scan_all_sessions(rollouts)
             if not yes:
-                lines = [f"══ 会打包 {len(rollouts)} 个 session ══", ""]
+                mode_hint = "每个 rollout 一个 zip" if opts["split"] else "全部合并成一个 zip"
+                lines = [f"══ 会打包 {len(rollouts)} 个 session ({mode_hint}) ══", ""]
                 for rollout, kept, rejected, _ in display:
                     total = sum(_safe_stat(p) for p in kept)
                     lines.append(f"● {rollout.name}")
@@ -538,10 +544,51 @@ def main(argv=None):
                         lines.append(f"      … 还有 {len(kept)-5} 个")
                 lines.append("")
                 lines.append("下一步:")
-                lines.append("  codex-save-trace --yes all         上传全部")
-                lines.append("  codex-save-trace --yes all --local 只本地打包")
+                lines.append("  codex-save-trace --yes all           一个 zip、+1 分")
+                lines.append("  codex-save-trace --yes all --split   每 session 一个 zip、各 +1 分")
+                lines.append("  codex-save-trace --yes all --local   只本地打包")
                 print("\n".join(lines))
                 return 0
+
+            # --split: run one upload per rollout, aggregate results.
+            if opts["split"]:
+                results = []
+                errors = []
+                for r in rollouts:
+                    sid = uploader._sid_from_rollout(r)
+                    files = files_by_session.get(sid, [])
+                    try:
+                        one = uploader.save_trace_bundle(
+                            session=r.stem,
+                            files_by_session={sid: [str(p) for p in files]},
+                            name=name, note=note,
+                            local=local, out_dir=out_dir,
+                        )
+                        results.append(one)
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append((r.name, str(exc)))
+                # Print a concise multi-line summary
+                total_files = sum(r.get("files_uploaded", r.get("files_saved", 0))
+                                  for r in results)
+                total_bytes = sum(r.get("zip_bytes", 0) for r in results)
+                mode = "上传" if not local else "本地打包"
+                icon = "📤" if not local else "💾"
+                print(f"{icon} 拆分{mode}完成: {len(results)}/{len(rollouts)} 个 rollout, "
+                      f"{total_files} 个文件, 共 {_fmt_size(total_bytes)}")
+                for r in results[:20]:
+                    if local:
+                        print(f"  · {r.get('zip_path')}")
+                    else:
+                        print(f"  · {r.get('user_page')}  ({r.get('selector')})")
+                if len(results) > 20:
+                    print(f"  … 还有 {len(results)-20} 条")
+                if errors:
+                    print(f"\n⚠️ 失败 {len(errors)} 条:")
+                    for name_, why in errors[:10]:
+                        print(f"  ✗ {name_} — {why}")
+                return 0 if not errors else 1
+
+            # Default: one combined zip.
             res = uploader.save_trace_bundle(
                 session=session, name=name, note=note,
                 files_by_session={sid: [str(p) for p in files]
