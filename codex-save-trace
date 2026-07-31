@@ -240,7 +240,8 @@ def _fmt_size(n: int) -> str:
     return f"{n} B"
 
 
-def _format_bundle_preview(session_path, kept, rejected, changes, verbose=False):
+def _format_bundle_preview(session_path, kept, rejected, changes,
+                           verbose=False, picked=False):
     lines = []
 
     # ---- Rollout line ----
@@ -249,7 +250,9 @@ def _format_bundle_preview(session_path, kept, rejected, changes, verbose=False)
         env_file = os.environ.get("CODEX_SESSION_FILE", "").strip()
         env_sid = os.environ.get("CODEX_SESSION_ID", "").strip() or \
                   os.environ.get("CODEX_ROLLOUT_ID", "").strip()
-        if env_file and str(Path(env_file).expanduser()) == sp_str:
+        if picked:
+            tag = "手动选中 (--pick)"
+        elif env_file and str(Path(env_file).expanduser()) == sp_str:
             tag = "当前会话 (来自 CODEX_SESSION_FILE)"
         elif env_sid and env_sid in session_path.name:
             tag = "当前会话 (来自 CODEX_SESSION_ID)"
@@ -508,7 +511,11 @@ def main(argv=None):
         if picked is None:
             print("(picker cancelled)")
             return 0
-        session = uploader._sid_from_rollout(picked)
+        # Use the FULL rollout filename stem as selector — this is unique
+        # per file, so resolve_sessions() finds exactly this rollout and
+        # nothing else. Using just the sid tail can accidentally match
+        # multiple files if timestamps happen to share hex bytes.
+        session = picked.stem
         print(f"选中: {picked.name}\n")
 
     try:
@@ -547,13 +554,19 @@ def main(argv=None):
 
         # ---- single-session path (default) ----
         kept, rejected, changes, session_path = [], [], [], None
+        # Resolve the actual rollout file for `session` — respects --pick's
+        # override, an explicit id-fragment positional arg, or defaults to
+        # the current/most-recent rollout.
+        try:
+            resolved_files, _lbl = uploader.resolve_sessions(session)
+            session_path = resolved_files[0] if resolved_files else None
+        except FileNotFoundError as exc:
+            return _err(str(exc))
+
         if not opts["no_files"]:
-            scanned, rejected, session_path = _scan_and_filter()
+            scanned, rejected, _ = _scan_and_filter(session_path)
             kept, changes = _apply_tweaks(scanned, opts["exclude"],
                                           opts["add"], opts["only"])
-        else:
-            files, _ = uploader.resolve_sessions(session)
-            session_path = files[0] if files else None
 
         if not yes:
             if opts["no_files"]:
@@ -566,7 +579,8 @@ def main(argv=None):
                 )
                 return 0
             print(_format_bundle_preview(session_path, kept, rejected, changes,
-                                         verbose=opts["verbose"]))
+                                         verbose=opts["verbose"],
+                                         picked=opts["pick"]))
             return 0
 
         extra = [str(p) for p in kept]
